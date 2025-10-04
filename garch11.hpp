@@ -1,4 +1,3 @@
-#pragma once
 //inspired from https://github.com/kkew3/garch11/blob/main/src/garch11.cpp
 #include <algorithm>
 #include <cmath>
