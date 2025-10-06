@@ -1,7 +1,7 @@
 # GARCH(1,1) Estimation Using Nelder–Mead Optimization
 
 This project demonstrates a **numerically stable GARCH(1,1)** log-likelihood evaluation and parameter estimation using the **Nelder–Mead simplex algorithm** implemented in C++.
-It provides an end-to-end workflow — from generating synthetic GARCH data to recovering the model parameters via numerical optimization.
+It provides an end-to-end workflow from generating synthetic GARCH data to recovering the model parameters via numerical optimization.
 
 ---
 
