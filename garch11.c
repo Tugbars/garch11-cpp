@@ -24,18 +24,19 @@
 /**
  * Enable Flush-To-Zero (FTZ) and Denormals-Are-Zero (DAZ)
  * Prevents performance degradation from denormal arithmetic
- * Call once at initialization
+ *
+ * MXCSR is per-thread, so this must be called from each thread.
  */
-static inline void enable_ftz_daz(void)
+void garch_enable_ftz_daz(void)
 {
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
     _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
 }
 
-// Auto-enable on library load
+// Auto-enable on library load (main thread only)
 __attribute__((constructor)) static void garch_init(void)
 {
-    enable_ftz_daz();
+    garch_enable_ftz_daz();
 }
 #endif
 
@@ -72,6 +73,7 @@ static inline double dynamic_eps(double level, const garch_config_t *cfg)
 
 /**
  * FAST PATH: Clamp sigma2 without tracking (branch-free hot path)
+ * Returns clamped value
  */
 static inline __attribute__((always_inline)) double safe_sigma2_fast(double sigma2_raw, double level,
                                                                      const garch_config_t *cfg)
@@ -82,8 +84,42 @@ static inline __attribute__((always_inline)) double safe_sigma2_fast(double sigm
 }
 
 /**
+ * FAST PATH with clamp detection: Returns both clamped value and whether clamping occurred
+ */
+static inline __attribute__((always_inline)) double safe_sigma2_fast_detect(double sigma2_raw, double level,
+                                                                            const garch_config_t *cfg,
+                                                                            bool *clamped)
+{
+    const double scale = (level > 1.0) ? level : 1.0;
+    const double eps = (cfg->eps_base * scale < cfg->eps_min) ? cfg->eps_min : cfg->eps_base * scale;
+    *clamped = (sigma2_raw < eps);
+    return (*clamped) ? eps : sigma2_raw;
+}
+
+/**
  * TRACKING PATH: Clamp sigma2 with statistics (for diagnostics)
- * Uses atomic increment if C11 atomics available (thread-safe)
+ * Uses atomic increment for thread safety (sigma2_clamps is atomic_int)
+ * Returns both clamped value and whether clamping occurred
+ */
+static inline __attribute__((always_inline)) double safe_sigma2_track_detect(double sigma2_raw, double level,
+                                                                             const garch_config_t *cfg,
+                                                                             garch_clamp_stats_t *stats,
+                                                                             bool *clamped)
+{
+    const double scale = (level > 1.0) ? level : 1.0;
+    const double eps = (cfg->eps_base * scale < cfg->eps_min) ? cfg->eps_min : cfg->eps_base * scale;
+    *clamped = (sigma2_raw < eps);
+    if (*clamped)
+    {
+        // Thread-safe atomic increment (no cast needed - field is atomic_int)
+        atomic_fetch_add_explicit(&stats->sigma2_clamps, 1, memory_order_relaxed);
+    }
+    return (*clamped) ? eps : sigma2_raw;
+}
+
+/**
+ * TRACKING PATH: Clamp sigma2 with statistics (for diagnostics)
+ * Uses atomic increment for thread safety (sigma2_clamps is atomic_int)
  */
 static inline __attribute__((always_inline)) double safe_sigma2_track(double sigma2_raw, double level,
                                                                       const garch_config_t *cfg,
@@ -94,8 +130,8 @@ static inline __attribute__((always_inline)) double safe_sigma2_track(double sig
     const bool clamped = (sigma2_raw < eps);
     if (clamped)
     {
-        // Thread-safe atomic increment (C11)
-        atomic_fetch_add_explicit((_Atomic int *)&stats->sigma2_clamps, 1, memory_order_relaxed);
+        // Thread-safe atomic increment (no cast needed - field is atomic_int)
+        atomic_fetch_add_explicit(&stats->sigma2_clamps, 1, memory_order_relaxed);
     }
     return clamped ? eps : sigma2_raw;
 }
@@ -334,7 +370,7 @@ double garch_nll_bc(const garch_params_t *restrict params,
 }
 
 /**
- * Scalar gradient with backcast - optimized
+ * Scalar gradient with backcast - optimized with STOPGRAD support
  */
 void garch_gradient_bc(const garch_params_t *restrict params,
                        const garch_data_t *restrict data,
@@ -348,7 +384,7 @@ void garch_gradient_bc(const garch_params_t *restrict params,
     const double omega = params->omega;
     const double alpha = params->alpha;
     const double beta = params->beta;
-    const double *restrict r2 = data->r2;
+    const double *restrict r2 = (const double *)__builtin_assume_aligned(data->r2, 32);
     const int n = data->n;
     const double bc = data->backcast;
 
@@ -358,20 +394,31 @@ void garch_gradient_bc(const garch_params_t *restrict params,
         return;
     }
 
-    const int prefetch_dist = 64;
+    const int prefetch_elems = 64;
     const bool track = cfg->track_clamps && stats;
+    const bool sanitize = cfg->sanitize_r2;
+    const bool stopgrad = (cfg->clamp_policy == GARCH_CLAMP_STOPGRAD);
 
     if (!track)
     {
         // FAST PATH
+        double r2_0 = sanitize ? clean_r2(r2[0]) : r2[0];
+
+        bool clamped_0;
         double s = omega + (alpha + beta) * bc;
-        s = safe_sigma2_fast(s, s, cfg);
+        s = safe_sigma2_fast_detect(s, s, cfg, &clamped_0);
 
         double d_omega = 1.0;
         double d_alpha = bc;
         double d_beta = bc;
 
-        double dterm = d_nll_term_d_sigma2(r2[0], s);
+        // STOPGRAD: zero partials if clamped at step 0
+        if (stopgrad && clamped_0)
+        {
+            d_omega = d_alpha = d_beta = 0.0;
+        }
+
+        double dterm = d_nll_term_d_sigma2(r2_0, s);
         double grad_omega = dterm * d_omega;
         double grad_alpha = dterm * d_alpha;
         double grad_beta = dterm * d_beta;
@@ -380,24 +427,40 @@ void garch_gradient_bc(const garch_params_t *restrict params,
 
         for (int i = 1; i < n; i++)
         {
-            if (i + prefetch_dist < n)
+            if (i + prefetch_elems < n)
             {
-                __builtin_prefetch(&r2[i + prefetch_dist], 0, 3);
+                __builtin_prefetch(&r2[i + prefetch_elems], 0, 3);
             }
 
-            s = omega + fma(alpha, r2[i - 1], beta * s_prev);
-            const double level = (s > s_prev) ? s : s_prev;
-            s = safe_sigma2_fast(s, level, cfg);
+            double r2_prev = sanitize ? clean_r2(r2[i - 1]) : r2[i - 1];
+            double r2_curr = sanitize ? clean_r2(r2[i]) : r2[i];
 
+            double s_raw = omega + fma(alpha, r2_prev, beta * s_prev);
+            const double level = (s_raw > s_prev) ? s_raw : s_prev;
+
+            bool clamped_i;
+            s = safe_sigma2_fast_detect(s_raw, level, cfg, &clamped_i);
+
+            // Step 1: Update partials using standard recurrence
             d_omega = fma(beta, d_omega, 1.0);
-            d_alpha = fma(beta, d_alpha, r2[i - 1]);
+            d_alpha = fma(beta, d_alpha, r2_prev);
             d_beta = fma(beta, d_beta, s_prev);
 
-            dterm = d_nll_term_d_sigma2(r2[i], s);
+            // Step 2: STOPGRAD - zero partials BEFORE accumulating gradient
+            if (stopgrad && clamped_i)
+            {
+                d_omega = 0.0;
+                d_alpha = 0.0;
+                d_beta = 0.0;
+            }
+
+            // Step 3: Accumulate gradient using (possibly zeroed) partials
+            dterm = d_nll_term_d_sigma2(r2_curr, s);
             grad_omega = fma(dterm, d_omega, grad_omega);
             grad_alpha = fma(dterm, d_alpha, grad_alpha);
             grad_beta = fma(dterm, d_beta, grad_beta);
 
+            // Step 4: Continue (next iteration will re-introduce constants via recurrence)
             s_prev = s;
         }
 
@@ -408,14 +471,22 @@ void garch_gradient_bc(const garch_params_t *restrict params,
     else
     {
         // TRACKING PATH
+        double r2_0 = sanitize ? clean_r2(r2[0]) : r2[0];
+
+        bool clamped_0;
         double s = omega + (alpha + beta) * bc;
-        s = safe_sigma2_track(s, s, cfg, stats);
+        s = safe_sigma2_track_detect(s, s, cfg, stats, &clamped_0);
 
         double d_omega = 1.0;
         double d_alpha = bc;
         double d_beta = bc;
 
-        double dterm = d_nll_term_d_sigma2(r2[0], s);
+        if (stopgrad && clamped_0)
+        {
+            d_omega = d_alpha = d_beta = 0.0;
+        }
+
+        double dterm = d_nll_term_d_sigma2(r2_0, s);
         double grad_omega = dterm * d_omega;
         double grad_alpha = dterm * d_alpha;
         double grad_beta = dterm * d_beta;
@@ -424,20 +495,32 @@ void garch_gradient_bc(const garch_params_t *restrict params,
 
         for (int i = 1; i < n; i++)
         {
-            if (i + prefetch_dist < n)
+            if (i + prefetch_elems < n)
             {
-                __builtin_prefetch(&r2[i + prefetch_dist], 0, 3);
+                __builtin_prefetch(&r2[i + prefetch_elems], 0, 3);
             }
 
-            s = omega + fma(alpha, r2[i - 1], beta * s_prev);
-            const double level = (s > s_prev) ? s : s_prev;
-            s = safe_sigma2_track(s, level, cfg, stats);
+            double r2_prev = sanitize ? clean_r2(r2[i - 1]) : r2[i - 1];
+            double r2_curr = sanitize ? clean_r2(r2[i]) : r2[i];
+
+            double s_raw = omega + fma(alpha, r2_prev, beta * s_prev);
+            const double level = (s_raw > s_prev) ? s_raw : s_prev;
+
+            bool clamped_i;
+            s = safe_sigma2_track_detect(s_raw, level, cfg, stats, &clamped_i);
 
             d_omega = fma(beta, d_omega, 1.0);
-            d_alpha = fma(beta, d_alpha, r2[i - 1]);
+            d_alpha = fma(beta, d_alpha, r2_prev);
             d_beta = fma(beta, d_beta, s_prev);
 
-            dterm = d_nll_term_d_sigma2(r2[i], s);
+            if (stopgrad && clamped_i)
+            {
+                d_omega = 0.0;
+                d_alpha = 0.0;
+                d_beta = 0.0;
+            }
+
+            dterm = d_nll_term_d_sigma2(r2_curr, s);
             grad_omega = fma(dterm, d_omega, grad_omega);
             grad_alpha = fma(dterm, d_alpha, grad_alpha);
             grad_beta = fma(dterm, d_beta, grad_beta);
@@ -452,7 +535,7 @@ void garch_gradient_bc(const garch_params_t *restrict params,
 }
 
 /**
- * Scalar NLL + gradient combined (most efficient for small n)
+ * Scalar NLL + gradient combined (most efficient for small n) with STOPGRAD support
  */
 double garch_nll_gradient_bc(const garch_params_t *restrict params,
                              const garch_data_t *restrict data,
@@ -466,7 +549,7 @@ double garch_nll_gradient_bc(const garch_params_t *restrict params,
     const double omega = params->omega;
     const double alpha = params->alpha;
     const double beta = params->beta;
-    const double *restrict r2 = data->r2;
+    const double *restrict r2 = (const double *)__builtin_assume_aligned(data->r2, 32);
     const int n = data->n;
     const double bc = data->backcast;
 
@@ -476,24 +559,34 @@ double garch_nll_gradient_bc(const garch_params_t *restrict params,
         return INFINITY;
     }
 
-    const int prefetch_dist = 64;
+    const int prefetch_elems = 64;
     const bool track = cfg->track_clamps && stats;
+    const bool sanitize = cfg->sanitize_r2;
+    const bool stopgrad = (cfg->clamp_policy == GARCH_CLAMP_STOPGRAD);
 
     if (!track)
     {
         // FAST PATH
+        double r2_0 = sanitize ? clean_r2(r2[0]) : r2[0];
+
+        bool clamped_0;
         double s = omega + (alpha + beta) * bc;
-        s = safe_sigma2_fast(s, s, cfg);
+        s = safe_sigma2_fast_detect(s, s, cfg, &clamped_0);
 
         double inv = 1.0 / s;
         double ln = log(s);
-        double nll = fma(r2[0], inv, ln);
+        double nll = fma(r2_0, inv, ln);
 
         double d_omega = 1.0;
         double d_alpha = bc;
         double d_beta = bc;
 
-        double dterm = inv * (1.0 - r2[0] * inv);
+        if (stopgrad && clamped_0)
+        {
+            d_omega = d_alpha = d_beta = 0.0;
+        }
+
+        double dterm = inv * (1.0 - r2_0 * inv);
         double grad_omega = dterm * d_omega;
         double grad_alpha = dterm * d_alpha;
         double grad_beta = dterm * d_beta;
@@ -502,26 +595,39 @@ double garch_nll_gradient_bc(const garch_params_t *restrict params,
 
         for (int i = 1; i < n; i++)
         {
-            if (i + prefetch_dist < n)
+            if (i + prefetch_elems < n)
             {
-                __builtin_prefetch(&r2[i + prefetch_dist], 0, 3);
+                __builtin_prefetch(&r2[i + prefetch_elems], 0, 3);
             }
 
-            s = omega + fma(alpha, r2[i - 1], beta * s_prev);
-            const double level = (s > s_prev) ? s : s_prev;
-            s = safe_sigma2_fast(s, level, cfg);
+            double r2_prev = sanitize ? clean_r2(r2[i - 1]) : r2[i - 1];
+            double r2_curr = sanitize ? clean_r2(r2[i]) : r2[i];
+
+            double s_raw = omega + fma(alpha, r2_prev, beta * s_prev);
+            const double level = (s_raw > s_prev) ? s_raw : s_prev;
+
+            bool clamped_i;
+            s = safe_sigma2_fast_detect(s_raw, level, cfg, &clamped_i);
 
             // NLL term
             inv = 1.0 / s;
             ln = log(s);
-            nll += fma(r2[i], inv, ln);
+            nll += fma(r2_curr, inv, ln);
 
             // Gradient update
             d_omega = fma(beta, d_omega, 1.0);
-            d_alpha = fma(beta, d_alpha, r2[i - 1]);
+            d_alpha = fma(beta, d_alpha, r2_prev);
             d_beta = fma(beta, d_beta, s_prev);
 
-            dterm = inv * (1.0 - r2[i] * inv);
+            // STOPGRAD: zero before using
+            if (stopgrad && clamped_i)
+            {
+                d_omega = 0.0;
+                d_alpha = 0.0;
+                d_beta = 0.0;
+            }
+
+            dterm = inv * (1.0 - r2_curr * inv);
             grad_omega = fma(dterm, d_omega, grad_omega);
             grad_alpha = fma(dterm, d_alpha, grad_alpha);
             grad_beta = fma(dterm, d_beta, grad_beta);
@@ -537,18 +643,26 @@ double garch_nll_gradient_bc(const garch_params_t *restrict params,
     else
     {
         // TRACKING PATH
+        double r2_0 = sanitize ? clean_r2(r2[0]) : r2[0];
+
+        bool clamped_0;
         double s = omega + (alpha + beta) * bc;
-        s = safe_sigma2_track(s, s, cfg, stats);
+        s = safe_sigma2_track_detect(s, s, cfg, stats, &clamped_0);
 
         double inv = 1.0 / s;
         double ln = log(s);
-        double nll = fma(r2[0], inv, ln);
+        double nll = fma(r2_0, inv, ln);
 
         double d_omega = 1.0;
         double d_alpha = bc;
         double d_beta = bc;
 
-        double dterm = inv * (1.0 - r2[0] * inv);
+        if (stopgrad && clamped_0)
+        {
+            d_omega = d_alpha = d_beta = 0.0;
+        }
+
+        double dterm = inv * (1.0 - r2_0 * inv);
         double grad_omega = dterm * d_omega;
         double grad_alpha = dterm * d_alpha;
         double grad_beta = dterm * d_beta;
@@ -557,24 +671,36 @@ double garch_nll_gradient_bc(const garch_params_t *restrict params,
 
         for (int i = 1; i < n; i++)
         {
-            if (i + prefetch_dist < n)
+            if (i + prefetch_elems < n)
             {
-                __builtin_prefetch(&r2[i + prefetch_dist], 0, 3);
+                __builtin_prefetch(&r2[i + prefetch_elems], 0, 3);
             }
 
-            s = omega + fma(alpha, r2[i - 1], beta * s_prev);
-            const double level = (s > s_prev) ? s : s_prev;
-            s = safe_sigma2_track(s, level, cfg, stats);
+            double r2_prev = sanitize ? clean_r2(r2[i - 1]) : r2[i - 1];
+            double r2_curr = sanitize ? clean_r2(r2[i]) : r2[i];
+
+            double s_raw = omega + fma(alpha, r2_prev, beta * s_prev);
+            const double level = (s_raw > s_prev) ? s_raw : s_prev;
+
+            bool clamped_i;
+            s = safe_sigma2_track_detect(s_raw, level, cfg, stats, &clamped_i);
 
             inv = 1.0 / s;
             ln = log(s);
-            nll += fma(r2[i], inv, ln);
+            nll += fma(r2_curr, inv, ln);
 
             d_omega = fma(beta, d_omega, 1.0);
-            d_alpha = fma(beta, d_alpha, r2[i - 1]);
+            d_alpha = fma(beta, d_alpha, r2_prev);
             d_beta = fma(beta, d_beta, s_prev);
 
-            dterm = inv * (1.0 - r2[i] * inv);
+            if (stopgrad && clamped_i)
+            {
+                d_omega = 0.0;
+                d_alpha = 0.0;
+                d_beta = 0.0;
+            }
+
+            dterm = inv * (1.0 - r2_curr * inv);
             grad_omega = fma(dterm, d_omega, grad_omega);
             grad_alpha = fma(dterm, d_alpha, grad_alpha);
             grad_beta = fma(dterm, d_beta, grad_beta);
@@ -596,12 +722,13 @@ double garch_nll_gradient_bc(const garch_params_t *restrict params,
 #ifdef __AVX2__
 
 /**
- * AVX2 NLL + Gradient (vectorized Jacobian) - Optimized
+ * AVX2 NLL + Gradient (vectorized Jacobian) - Optimized with STOPGRAD
  *
  * Key optimizations:
  * - Vectorize {d_omega, d_alpha, d_beta} in parallel using AVX2
  * - Reduce shuffle overhead with blend instructions
  * - Loop unswitching for tracking vs fast path
+ * - STOPGRAD support: zero d_params when clamped
  * - 4x unrolling for better ILP
  */
 double garch_nll_gradient_bc_avx2(const garch_params_t *restrict params,
@@ -616,7 +743,7 @@ double garch_nll_gradient_bc_avx2(const garch_params_t *restrict params,
     const double omega = params->omega;
     const double alpha = params->alpha;
     const double beta = params->beta;
-    const double *restrict r2 = data->r2;
+    const double *restrict r2 = (const double *)__builtin_assume_aligned(data->r2, 32);
     const int n = data->n;
     const double bc = data->backcast;
 
@@ -626,167 +753,84 @@ double garch_nll_gradient_bc_avx2(const garch_params_t *restrict params,
         return INFINITY;
     }
 
-    const int prefetch_dist = 64;
+    const int prefetch_elems = 64;
     const bool track = cfg->track_clamps && stats;
+    const bool sanitize = cfg->sanitize_r2;
+    const bool stopgrad = (cfg->clamp_policy == GARCH_CLAMP_STOPGRAD);
 
-    // AVX2 constants (reduce redundant loads)
+    // AVX2 constants
     const __m256d ZERO = _mm256_setzero_pd();
     const __m256d ONE_VEC = _mm256_set1_pd(1.0);
     const __m256d beta_vec = _mm256_set1_pd(beta);
 
     if (!track)
     {
-        // ===== FAST PATH: No tracking =====
+        // ===== FAST PATH =====
+        double r2_0 = sanitize ? clean_r2(r2[0]) : r2[0];
+
+        bool clamped_0;
         double s = omega + (alpha + beta) * bc;
-        s = safe_sigma2_fast(s, s, cfg);
+        s = safe_sigma2_fast_detect(s, s, cfg, &clamped_0);
 
         double inv = 1.0 / s;
         double ln = log(s);
-        double nll = fma(r2[0], inv, ln);
+        double nll = fma(r2_0, inv, ln);
 
-        // Vectorize partials: [d_omega, d_alpha, d_beta, 0]
         __m256d d_params = _mm256_set_pd(0.0, bc, bc, 1.0);
 
-        double dterm = inv * (1.0 - r2[0] * inv);
+        // STOPGRAD: zero d_params if clamped
+        if (stopgrad && clamped_0)
+        {
+            d_params = ZERO;
+        }
+
+        double dterm = inv * (1.0 - r2_0 * inv);
         __m256d grad_vec = _mm256_mul_pd(_mm256_set1_pd(dterm), d_params);
 
         double s_prev = s;
 
-        // Main loop: 4x unrolled
-        int i = 1;
-        for (; i < n - 3; i += 4)
+        // Simplified non-unrolled loop for clarity with STOPGRAD
+        for (int i = 1; i < n; i++)
         {
-            // ===== Iteration 1 =====
+            if (i + prefetch_elems < n)
             {
-                if (i + prefetch_dist < n)
-                {
-                    __builtin_prefetch(&r2[i + prefetch_dist], 0, 3);
-                }
-
-                double s_next = omega + fma(alpha, r2[i - 1], beta * s_prev);
-                const double level = (s_next > s_prev) ? s_next : s_prev;
-                s_next = safe_sigma2_fast(s_next, level, cfg);
-
-                // NLL
-                inv = 1.0 / s_next;
-                ln = log(s_next);
-                nll += fma(r2[i], inv, ln);
-
-                // Vectorized gradient update (reduce shuffle overhead)
-                // Build updates = [1.0, r2[i-1], s_prev, 0] using blends
-                __m256d updates = ZERO;
-                updates = _mm256_blend_pd(updates, ONE_VEC, 0x1);                   // Lane 0 = 1.0
-                updates = _mm256_blend_pd(updates, _mm256_set1_pd(r2[i - 1]), 0x2); // Lane 1
-                updates = _mm256_blend_pd(updates, _mm256_set1_pd(s_prev), 0x4);    // Lane 2
-
-                d_params = _mm256_fmadd_pd(beta_vec, d_params, updates);
-
-                dterm = inv * (1.0 - r2[i] * inv);
-                grad_vec = _mm256_fmadd_pd(_mm256_set1_pd(dterm), d_params, grad_vec);
-
-                s_prev = s_next;
+                __builtin_prefetch(&r2[i + prefetch_elems], 0, 3);
             }
 
-            // ===== Iteration 2 =====
-            {
-                double s_next = omega + fma(alpha, r2[i], beta * s_prev);
-                const double level = (s_next > s_prev) ? s_next : s_prev;
-                s_next = safe_sigma2_fast(s_next, level, cfg);
+            double r2_prev = sanitize ? clean_r2(r2[i - 1]) : r2[i - 1];
+            double r2_curr = sanitize ? clean_r2(r2[i]) : r2[i];
 
-                inv = 1.0 / s_next;
-                ln = log(s_next);
-                nll += fma(r2[i + 1], inv, ln);
+            double s_raw = omega + fma(alpha, r2_prev, beta * s_prev);
+            const double level = (s_raw > s_prev) ? s_raw : s_prev;
 
-                __m256d updates = ZERO;
-                updates = _mm256_blend_pd(updates, ONE_VEC, 0x1);
-                updates = _mm256_blend_pd(updates, _mm256_set1_pd(r2[i]), 0x2);
-                updates = _mm256_blend_pd(updates, _mm256_set1_pd(s_prev), 0x4);
+            bool clamped_i;
+            double s_next = safe_sigma2_fast_detect(s_raw, level, cfg, &clamped_i);
 
-                d_params = _mm256_fmadd_pd(beta_vec, d_params, updates);
-
-                dterm = inv * (1.0 - r2[i + 1] * inv);
-                grad_vec = _mm256_fmadd_pd(_mm256_set1_pd(dterm), d_params, grad_vec);
-
-                s_prev = s_next;
-            }
-
-            // ===== Iteration 3 =====
-            {
-                double s_next = omega + fma(alpha, r2[i + 1], beta * s_prev);
-                const double level = (s_next > s_prev) ? s_next : s_prev;
-                s_next = safe_sigma2_fast(s_next, level, cfg);
-
-                inv = 1.0 / s_next;
-                ln = log(s_next);
-                nll += fma(r2[i + 2], inv, ln);
-
-                __m256d updates = ZERO;
-                updates = _mm256_blend_pd(updates, ONE_VEC, 0x1);
-                updates = _mm256_blend_pd(updates, _mm256_set1_pd(r2[i + 1]), 0x2);
-                updates = _mm256_blend_pd(updates, _mm256_set1_pd(s_prev), 0x4);
-
-                d_params = _mm256_fmadd_pd(beta_vec, d_params, updates);
-
-                dterm = inv * (1.0 - r2[i + 2] * inv);
-                grad_vec = _mm256_fmadd_pd(_mm256_set1_pd(dterm), d_params, grad_vec);
-
-                s_prev = s_next;
-            }
-
-            // ===== Iteration 4 =====
-            {
-                double s_next = omega + fma(alpha, r2[i + 2], beta * s_prev);
-                const double level = (s_next > s_prev) ? s_next : s_prev;
-                s_next = safe_sigma2_fast(s_next, level, cfg);
-
-                inv = 1.0 / s_next;
-                ln = log(s_next);
-                nll += fma(r2[i + 3], inv, ln);
-
-                __m256d updates = ZERO;
-                updates = _mm256_blend_pd(updates, ONE_VEC, 0x1);
-                updates = _mm256_blend_pd(updates, _mm256_set1_pd(r2[i + 2]), 0x2);
-                updates = _mm256_blend_pd(updates, _mm256_set1_pd(s_prev), 0x4);
-
-                d_params = _mm256_fmadd_pd(beta_vec, d_params, updates);
-
-                dterm = inv * (1.0 - r2[i + 3] * inv);
-                grad_vec = _mm256_fmadd_pd(_mm256_set1_pd(dterm), d_params, grad_vec);
-
-                s_prev = s_next;
-            }
-        }
-
-        // Remainder loop
-        for (; i < n; i++)
-        {
-            if (i + prefetch_dist < n)
-            {
-                __builtin_prefetch(&r2[i + prefetch_dist], 0, 3);
-            }
-
-            double s_next = omega + fma(alpha, r2[i - 1], beta * s_prev);
-            const double level = (s_next > s_prev) ? s_next : s_prev;
-            s_next = safe_sigma2_fast(s_next, level, cfg);
-
+            // NLL
             inv = 1.0 / s_next;
             ln = log(s_next);
-            nll += fma(r2[i], inv, ln);
+            nll += fma(r2_curr, inv, ln);
 
+            // Vectorized gradient update
             __m256d updates = ZERO;
             updates = _mm256_blend_pd(updates, ONE_VEC, 0x1);
-            updates = _mm256_blend_pd(updates, _mm256_set1_pd(r2[i - 1]), 0x2);
+            updates = _mm256_blend_pd(updates, _mm256_set1_pd(r2_prev), 0x2);
             updates = _mm256_blend_pd(updates, _mm256_set1_pd(s_prev), 0x4);
 
             d_params = _mm256_fmadd_pd(beta_vec, d_params, updates);
 
-            dterm = inv * (1.0 - r2[i] * inv);
+            // STOPGRAD: zero d_params BEFORE accumulating gradient
+            if (stopgrad && clamped_i)
+            {
+                d_params = ZERO;
+            }
+
+            dterm = inv * (1.0 - r2_curr * inv);
             grad_vec = _mm256_fmadd_pd(_mm256_set1_pd(dterm), d_params, grad_vec);
 
             s_prev = s_next;
         }
 
-        // Extract gradient components
         double grad_array[4] __attribute__((aligned(32)));
         _mm256_store_pd(grad_array, grad_vec);
 
@@ -799,44 +843,61 @@ double garch_nll_gradient_bc_avx2(const garch_params_t *restrict params,
     else
     {
         // ===== TRACKING PATH =====
+        double r2_0 = sanitize ? clean_r2(r2[0]) : r2[0];
+
+        bool clamped_0;
         double s = omega + (alpha + beta) * bc;
-        s = safe_sigma2_track(s, s, cfg, stats);
+        s = safe_sigma2_track_detect(s, s, cfg, stats, &clamped_0);
 
         double inv = 1.0 / s;
         double ln = log(s);
-        double nll = fma(r2[0], inv, ln);
+        double nll = fma(r2_0, inv, ln);
 
         __m256d d_params = _mm256_set_pd(0.0, bc, bc, 1.0);
 
-        double dterm = inv * (1.0 - r2[0] * inv);
+        if (stopgrad && clamped_0)
+        {
+            d_params = ZERO;
+        }
+
+        double dterm = inv * (1.0 - r2_0 * inv);
         __m256d grad_vec = _mm256_mul_pd(_mm256_set1_pd(dterm), d_params);
 
         double s_prev = s;
 
-        // Simplified loop (tracking is cold path, less aggressive optimization)
         for (int i = 1; i < n; i++)
         {
-            if (i + prefetch_dist < n)
+            if (i + prefetch_elems < n)
             {
-                __builtin_prefetch(&r2[i + prefetch_dist], 0, 3);
+                __builtin_prefetch(&r2[i + prefetch_elems], 0, 3);
             }
 
-            double s_next = omega + fma(alpha, r2[i - 1], beta * s_prev);
-            const double level = (s_next > s_prev) ? s_next : s_prev;
-            s_next = safe_sigma2_track(s_next, level, cfg, stats);
+            double r2_prev = sanitize ? clean_r2(r2[i - 1]) : r2[i - 1];
+            double r2_curr = sanitize ? clean_r2(r2[i]) : r2[i];
+
+            double s_raw = omega + fma(alpha, r2_prev, beta * s_prev);
+            const double level = (s_raw > s_prev) ? s_raw : s_prev;
+
+            bool clamped_i;
+            double s_next = safe_sigma2_track_detect(s_raw, level, cfg, stats, &clamped_i);
 
             inv = 1.0 / s_next;
             ln = log(s_next);
-            nll += fma(r2[i], inv, ln);
+            nll += fma(r2_curr, inv, ln);
 
             __m256d updates = ZERO;
             updates = _mm256_blend_pd(updates, ONE_VEC, 0x1);
-            updates = _mm256_blend_pd(updates, _mm256_set1_pd(r2[i - 1]), 0x2);
+            updates = _mm256_blend_pd(updates, _mm256_set1_pd(r2_prev), 0x2);
             updates = _mm256_blend_pd(updates, _mm256_set1_pd(s_prev), 0x4);
 
             d_params = _mm256_fmadd_pd(beta_vec, d_params, updates);
 
-            dterm = inv * (1.0 - r2[i] * inv);
+            if (stopgrad && clamped_i)
+            {
+                d_params = ZERO;
+            }
+
+            dterm = inv * (1.0 - r2_curr * inv);
             grad_vec = _mm256_fmadd_pd(_mm256_set1_pd(dterm), d_params, grad_vec);
 
             s_prev = s_next;
@@ -854,7 +915,7 @@ double garch_nll_gradient_bc_avx2(const garch_params_t *restrict params,
 }
 
 /**
- * AVX2 NLL only (no gradient) - Optimized
+ * AVX2 NLL only (no gradient) - Optimized with sanitization support
  */
 double garch_nll_bc_avx2(const garch_params_t *restrict params,
                          const garch_data_t *restrict data,
@@ -867,7 +928,7 @@ double garch_nll_bc_avx2(const garch_params_t *restrict params,
     const double omega = params->omega;
     const double alpha = params->alpha;
     const double beta = params->beta;
-    const double *restrict r2 = data->r2;
+    const double *restrict r2 = (const double *)__builtin_assume_aligned(data->r2, 32);
     const int n = data->n;
     const double bc = data->backcast;
 
@@ -876,8 +937,9 @@ double garch_nll_bc_avx2(const garch_params_t *restrict params,
         return INFINITY;
     }
 
-    const int prefetch_dist = 64;
+    const int prefetch_elems = 64;
     const bool track = cfg->track_clamps && stats;
+    const bool sanitize = cfg->sanitize_r2;
 
     if (!track)
     {
@@ -885,46 +947,52 @@ double garch_nll_bc_avx2(const garch_params_t *restrict params,
         double s = omega + (alpha + beta) * bc;
         s = safe_sigma2_fast(s, s, cfg);
 
+        double r2_0 = sanitize ? clean_r2(r2[0]) : r2[0];
         double inv = 1.0 / s;
         double ln = log(s);
-        double nll = fma(r2[0], inv, ln);
+        double nll = fma(r2_0, inv, ln);
 
         // 4x unrolled
         int i = 1;
         for (; i < n - 3; i += 4)
         {
-            if (i + prefetch_dist < n)
+            if (i + prefetch_elems < n)
             {
-                __builtin_prefetch(&r2[i + prefetch_dist], 0, 3);
+                __builtin_prefetch(&r2[i + prefetch_elems], 0, 3);
             }
 
-            double s1 = omega + fma(alpha, r2[i - 1], beta * s);
+            double r2_0 = sanitize ? clean_r2(r2[i - 1]) : r2[i - 1];
+            double s1 = omega + fma(alpha, r2_0, beta * s);
             const double l1 = (s1 > s) ? s1 : s;
             s1 = safe_sigma2_fast(s1, l1, cfg);
             inv = 1.0 / s1;
             ln = log(s1);
-            nll += fma(r2[i], inv, ln);
+            double r2_1 = sanitize ? clean_r2(r2[i]) : r2[i];
+            nll += fma(r2_1, inv, ln);
 
-            double s2 = omega + fma(alpha, r2[i], beta * s1);
+            double r2_2 = sanitize ? clean_r2(r2[i + 1]) : r2[i + 1];
+            double s2 = omega + fma(alpha, r2_1, beta * s1);
             const double l2 = (s2 > s1) ? s2 : s1;
             s2 = safe_sigma2_fast(s2, l2, cfg);
             inv = 1.0 / s2;
             ln = log(s2);
-            nll += fma(r2[i + 1], inv, ln);
+            nll += fma(r2_2, inv, ln);
 
-            double s3 = omega + fma(alpha, r2[i + 1], beta * s2);
+            double r2_3 = sanitize ? clean_r2(r2[i + 2]) : r2[i + 2];
+            double s3 = omega + fma(alpha, r2_2, beta * s2);
             const double l3 = (s3 > s2) ? s3 : s2;
             s3 = safe_sigma2_fast(s3, l3, cfg);
             inv = 1.0 / s3;
             ln = log(s3);
-            nll += fma(r2[i + 2], inv, ln);
+            nll += fma(r2_3, inv, ln);
 
-            double s4 = omega + fma(alpha, r2[i + 2], beta * s3);
+            double r2_4 = sanitize ? clean_r2(r2[i + 3]) : r2[i + 3];
+            double s4 = omega + fma(alpha, r2_3, beta * s3);
             const double l4 = (s4 > s3) ? s4 : s3;
             s4 = safe_sigma2_fast(s4, l4, cfg);
             inv = 1.0 / s4;
             ln = log(s4);
-            nll += fma(r2[i + 3], inv, ln);
+            nll += fma(r2_4, inv, ln);
 
             s = s4;
         }
@@ -932,17 +1000,19 @@ double garch_nll_bc_avx2(const garch_params_t *restrict params,
         // Remainder
         for (; i < n; i++)
         {
-            if (i + prefetch_dist < n)
+            if (i + prefetch_elems < n)
             {
-                __builtin_prefetch(&r2[i + prefetch_dist], 0, 3);
+                __builtin_prefetch(&r2[i + prefetch_elems], 0, 3);
             }
 
-            double s_next = omega + fma(alpha, r2[i - 1], beta * s);
+            double r2_prev = sanitize ? clean_r2(r2[i - 1]) : r2[i - 1];
+            double r2_curr = sanitize ? clean_r2(r2[i]) : r2[i];
+            double s_next = omega + fma(alpha, r2_prev, beta * s);
             const double level = (s_next > s) ? s_next : s;
             s_next = safe_sigma2_fast(s_next, level, cfg);
             inv = 1.0 / s_next;
             ln = log(s_next);
-            nll += fma(r2[i], inv, ln);
+            nll += fma(r2_curr, inv, ln);
             s = s_next;
         }
 
@@ -954,23 +1024,26 @@ double garch_nll_bc_avx2(const garch_params_t *restrict params,
         double s = omega + (alpha + beta) * bc;
         s = safe_sigma2_track(s, s, cfg, stats);
 
+        double r2_0 = sanitize ? clean_r2(r2[0]) : r2[0];
         double inv = 1.0 / s;
         double ln = log(s);
-        double nll = fma(r2[0], inv, ln);
+        double nll = fma(r2_0, inv, ln);
 
         for (int i = 1; i < n; i++)
         {
-            if (i + prefetch_dist < n)
+            if (i + prefetch_elems < n)
             {
-                __builtin_prefetch(&r2[i + prefetch_dist], 0, 3);
+                __builtin_prefetch(&r2[i + prefetch_elems], 0, 3);
             }
 
-            double s_next = omega + fma(alpha, r2[i - 1], beta * s);
+            double r2_prev = sanitize ? clean_r2(r2[i - 1]) : r2[i - 1];
+            double r2_curr = sanitize ? clean_r2(r2[i]) : r2[i];
+            double s_next = omega + fma(alpha, r2_prev, beta * s);
             const double level = (s_next > s) ? s_next : s;
             s_next = safe_sigma2_track(s_next, level, cfg, stats);
             inv = 1.0 / s_next;
             ln = log(s_next);
-            nll += fma(r2[i], inv, ln);
+            nll += fma(r2_curr, inv, ln);
             s = s_next;
         }
 
@@ -1008,7 +1081,6 @@ void garch_transform_bc(const garch_params_t *restrict params,
 
     const bool sanitize = cfg->sanitize_r2;
 
-    double r2_0 = sanitize ? clean_r2(r2[0]) : r2[0];
     double s0 = omega + (alpha + beta) * bc;
     sigma2[0] = safe_sigma2(s0, s0, cfg, stats);
 
@@ -1110,23 +1182,23 @@ void garch_predict(const garch_params_t *restrict params,
     if (!isfinite(last_r2))
         last_r2 = 0.0;
 
-    // First step
-    double s0 = omega + fma(alpha, last_r2, beta * last_sigma2);
-    const double l0 = (omega > s0) ? omega : s0;
-    s0 = safe_sigma2_fast(s0, l0, cfg);
+    // First step: consistent with recursion (use max(s_raw, prev_sigma))
+    double s0_raw = omega + fma(alpha, last_r2, beta * last_sigma2);
+    const double level0 = (s0_raw > last_sigma2) ? s0_raw : last_sigma2;
+    double s0 = safe_sigma2_fast(s0_raw, level0, cfg);
     sigma2[0] = s0;
 
     double z0 = isfinite(shocks[0]) ? shocks[0] : 0.0;
     returns[0] = z0 * sqrt(s0);
 
-    // Subsequent steps
+    // Subsequent steps: same policy throughout
     for (int i = 1; i < n; i++)
     {
         double zi = isfinite(shocks[i]) ? shocks[i] : 0.0;
         double r_prev_sq = returns[i - 1] * returns[i - 1];
-        double s = omega + fma(alpha, r_prev_sq, beta * sigma2[i - 1]);
-        const double level = (s > sigma2[i - 1]) ? s : sigma2[i - 1];
-        s = safe_sigma2_fast(s, level, cfg);
+        double s_raw = omega + fma(alpha, r_prev_sq, beta * sigma2[i - 1]);
+        const double level = (s_raw > sigma2[i - 1]) ? s_raw : sigma2[i - 1];
+        double s = safe_sigma2_fast(s_raw, level, cfg);
         sigma2[i] = s;
         returns[i] = zi * sqrt(s);
     }
